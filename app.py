@@ -8,6 +8,8 @@ import webbrowser
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
 from urllib.parse import parse_qs, urlparse
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from auth import auth_manager, auth_session
 from workflow_manager import workflow_manager
@@ -18,16 +20,136 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class OAuthCallbackHandler(BaseHTTPRequestHandler):
+    """HTTP handler for OAuth callbacks"""
+    
+    def do_GET(self):
+        """Handle GET request for OAuth callback"""
+        try:
+            # Parse the URL and query parameters
+            parsed_path = urlparse(self.path)
+            query_params = parse_qs(parsed_path.query)
+            
+            if parsed_path.path == '/auth/callback':
+                # Extract state and code from query parameters
+                state = query_params.get('state', [None])[0]
+                code = query_params.get('code', [None])[0]
+                error = query_params.get('error', [None])[0]
+                
+                if error:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(f"""
+                    <html><body>
+                    <h2>Authentication Error</h2>
+                    <p>Error: {error}</p>
+                    <p><a href="/">Return to application</a></p>
+                    </body></html>
+                    """.encode())
+                    return
+                
+                if not state or not code:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write("""
+                    <html><body>
+                    <h2>Invalid Request</h2>
+                    <p>Missing state or authorization code</p>
+                    <p><a href="/">Return to application</a></p>
+                    </body></html>
+                    """.encode())
+                    return
+                
+                # Store callback data for the main app to process
+                callback_url = f"http://localhost{self.path}"
+                app_instance.handle_oauth_callback_async(callback_url)
+                
+                # Send success response with instructions
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write("""
+                <html><body>
+                <h2>Authentication Successful!</h2>
+                <p>You have been signed in successfully. You can now close this tab and return to the application.</p>
+                <script>
+                    // Try to close the tab automatically
+                    setTimeout(function() {
+                        window.close();
+                    }, 2000);
+                </script>
+                <p><a href="/">Return to application</a></p>
+                </body></html>
+                """.encode())
+                
+            else:
+                # Handle other requests
+                self.send_response(404)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write("""
+                <html><body>
+                <h2>Not Found</h2>
+                <p><a href="/">Return to application</a></p>
+                </body></html>
+                """.encode())
+                
+        except Exception as e:
+            logger.error(f"Error handling OAuth callback: {e}")
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(f"""
+            <html><body>
+            <h2>Server Error</h2>
+            <p>Error processing request: {str(e)}</p>
+            <p><a href="/">Return to application</a></p>
+            </body></html>
+            """.encode())
+    
+    def log_message(self, format, *args):
+        """Suppress default HTTP server logging"""
+        pass
+
 class ComfyUIClientApp:
     def __init__(self):
         self.current_user = None
         self.current_session_id = None
         self.pending_oauth_states = {}  # Store OAuth state tokens
+        self.oauth_callback_data = {}  # Store callback data
+        self.callback_server = None
+        self.callback_server_thread = None
+        
+    def start_callback_server(self):
+        """Start the OAuth callback server"""
+        try:
+            self.callback_server = HTTPServer(('localhost', 8080), OAuthCallbackHandler)
+            self.callback_server_thread = threading.Thread(
+                target=self.callback_server.serve_forever,
+                daemon=True
+            )
+            self.callback_server_thread.start()
+            logger.info("OAuth callback server started on http://localhost:8080")
+        except Exception as e:
+            logger.error(f"Failed to start callback server: {e}")
+    
+    def stop_callback_server(self):
+        """Stop the OAuth callback server"""
+        if self.callback_server:
+            self.callback_server.shutdown()
+            self.callback_server = None
+            logger.info("OAuth callback server stopped")
         
     def start_oauth_login(self) -> Tuple[str, str]:
         """Start Google OAuth login process."""
         if not auth_manager.client_id:
             return "Google OAuth not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your environment.", ""
+        
+        # Start callback server if not already running
+        if not self.callback_server:
+            self.start_callback_server()
         
         # Generate state token for security
         state = secrets.token_urlsafe(32)
@@ -36,7 +158,43 @@ class ComfyUIClientApp:
         # Get authorization URL
         auth_url = auth_manager.get_authorization_url(state)
         
-        return f"Click the link below to sign in with Google:\n\n[Sign in with Google]({auth_url})", auth_url
+        return f"Click the link below to sign in with Google:\n\n[Sign in with Google]({auth_url})\n\nAfter signing in, you'll be redirected back automatically.", auth_url
+    
+    def handle_oauth_callback_async(self, callback_url: str):
+        """Handle OAuth callback asynchronously (called from callback server)"""
+        try:
+            message, is_logged_in, user_info = self.handle_oauth_callback(callback_url)
+            # Store the result for the main app to pick up
+            self.oauth_callback_data = {
+                'message': message,
+                'is_logged_in': is_logged_in,
+                'user_info': user_info,
+                'timestamp': time.time()
+            }
+            logger.info(f"OAuth callback processed: {message}")
+        except Exception as e:
+            logger.error(f"Error in async OAuth callback: {e}")
+            self.oauth_callback_data = {
+                'message': f"Authentication error: {str(e)}",
+                'is_logged_in': False,
+                'user_info': {},
+                'timestamp': time.time()
+            }
+    
+    def check_oauth_status(self) -> Tuple[str, bool, Dict[str, Any], bool]:
+        """Check if OAuth callback has been processed"""
+        if self.oauth_callback_data:
+            data = self.oauth_callback_data
+            self.oauth_callback_data = {}  # Clear after reading
+            
+            if data['is_logged_in']:
+                workflows = self.get_workflows_for_dropdown()
+                user_display = f"👤 **{data['user_info']['name']}** ({data['user_info']['email']}) - Role: {data['user_info']['role'].title()}"
+                return data['message'], data['is_logged_in'], data['user_info'], True, workflows, user_display
+            
+            return data['message'], data['is_logged_in'], data['user_info'], True, [], ""
+        
+        return "", False, {}, False, [], ""
     
     def handle_oauth_callback(self, callback_url: str) -> Tuple[str, bool, Dict[str, Any]]:
         """Handle OAuth callback and complete authentication."""
@@ -286,20 +444,9 @@ def create_interface():
             
             with gr.Row():
                 start_oauth_btn = gr.Button("Start Google Sign-In", variant="primary", size="lg")
+                check_status_btn = gr.Button("Check Sign-In Status", variant="secondary", size="lg")
                 
             oauth_info = gr.Markdown("")
-            
-            gr.Markdown("---")
-            gr.Markdown("### Complete Sign-In")
-            gr.Markdown("After signing in with Google, copy and paste the complete callback URL here:")
-            
-            callback_url_input = gr.Textbox(
-                label="Callback URL", 
-                placeholder="Paste the full URL from your browser after Google sign-in...",
-                lines=2
-            )
-            complete_signin_btn = gr.Button("Complete Sign-In", variant="secondary")
-            
             login_status = gr.Markdown("")
         
         # Main Application (initially hidden)
@@ -357,40 +504,44 @@ def create_interface():
             message, auth_url = app_instance.start_oauth_login()
             return message
         
-        def handle_complete_signin(callback_url):
-            if not callback_url.strip():
-                return "Please paste the callback URL", gr.update(visible=True), gr.update(visible=False), gr.update(), {}, False
+        def handle_check_status():
+            message, is_logged_in, user_info, has_update, workflows, user_display = app_instance.check_oauth_status()
             
-            message, is_logged_in, user_info = app_instance.handle_oauth_callback(callback_url)
-            
-            if is_logged_in:
-                workflows = app_instance.get_workflows_for_dropdown()
-                user_display = f"👤 **{user_info['name']}** ({user_info['email']}) - Role: {user_info['role'].title()}"
-                
-                return (
-                    message,  # login_status
-                    gr.update(visible=False),  # login_section
-                    gr.update(visible=True),   # main_section
-                    gr.update(choices=workflows, value=None),  # workflow_dropdown
-                    user_info,  # user_data state
-                    is_logged_in,  # logged_in state
-                    user_display  # user_info_display
-                )
+            if has_update:
+                if is_logged_in:
+                    return (
+                        message,  # login_status
+                        gr.update(visible=False),  # login_section
+                        gr.update(visible=True),   # main_section
+                        gr.update(choices=workflows, value=None),  # workflow_dropdown
+                        user_info,  # user_data state
+                        is_logged_in,  # logged_in state
+                        user_display  # user_info_display
+                    )
+                else:
+                    return (
+                        message,
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(choices=[], value=None),
+                        {},
+                        False,
+                        ""
+                    )
             else:
                 return (
-                    message,
-                    gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(choices=[], value=None),
-                    {},
-                    False,
-                    ""
+                    "No status update available. Click 'Start Google Sign-In' first, then sign in and check status again.",
+                    gr.update(),  # No change to login_section
+                    gr.update(),  # No change to main_section
+                    gr.update(),  # No change to workflow_dropdown
+                    gr.update(),  # No change to user_data
+                    gr.update(),  # No change to logged_in
+                    gr.update()   # No change to user_info_display
                 )
         
         def handle_logout():
             message, is_logged_in = app_instance.logout()
             return (
-                "",  # Clear callback input
                 message,  # login_status
                 gr.update(visible=True),   # login_section
                 gr.update(visible=False),  # main_section
@@ -463,9 +614,8 @@ def create_interface():
             outputs=[oauth_info]
         )
         
-        complete_signin_btn.click(
-            handle_complete_signin,
-            inputs=[callback_url_input],
+        check_status_btn.click(
+            handle_check_status,
             outputs=[
                 login_status,
                 login_section,
@@ -480,7 +630,6 @@ def create_interface():
         logout_btn.click(
             handle_logout,
             outputs=[
-                callback_url_input,
                 login_status,
                 login_section,
                 main_section,

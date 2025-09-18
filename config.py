@@ -10,7 +10,8 @@ class Config:
     # Google OAuth Configuration
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
     GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:7860/auth/callback")
+    # Updated to use port 8080 for the callback server
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8080/auth/callback")
     
     # Authentication
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this")
