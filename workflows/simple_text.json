@@ -1,0 +1,25 @@
+{
+  "display_name": "Simple Text Processing",
+  "description": "A simple workflow for text processing tasks",
+  "parameters": [
+    {
+      "name": "input_text",
+      "display_name": "Input Text",
+      "type": "textarea",
+      "default_value": "Hello, world!",
+      "description": "Text to process",
+      "required": true
+    }
+  ],
+  "workflow": {
+    "1": {
+      "inputs": {
+        "text": "@input_text"
+      },
+      "class_type": "TextProcessor",
+      "outputs": [
+        "TEXT"
+      ]
+    }
+  }
+}
