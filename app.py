@@ -8,8 +8,10 @@ import webbrowser
 from typing import Dict, List, Any, Optional, Tuple
 from PIL import Image
 from urllib.parse import parse_qs, urlparse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+import uvicorn
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from auth import auth_manager, auth_session
 from workflow_manager import workflow_manager
@@ -20,136 +22,17 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """HTTP handler for OAuth callbacks"""
-    
-    def do_GET(self):
-        """Handle GET request for OAuth callback"""
-        try:
-            # Parse the URL and query parameters
-            parsed_path = urlparse(self.path)
-            query_params = parse_qs(parsed_path.query)
-            
-            if parsed_path.path == '/auth/callback':
-                # Extract state and code from query parameters
-                state = query_params.get('state', [None])[0]
-                code = query_params.get('code', [None])[0]
-                error = query_params.get('error', [None])[0]
-                
-                if error:
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write(f"""
-                    <html><body>
-                    <h2>Authentication Error</h2>
-                    <p>Error: {error}</p>
-                    <p><a href="/">Return to application</a></p>
-                    </body></html>
-                    """.encode())
-                    return
-                
-                if not state or not code:
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write("""
-                    <html><body>
-                    <h2>Invalid Request</h2>
-                    <p>Missing state or authorization code</p>
-                    <p><a href="/">Return to application</a></p>
-                    </body></html>
-                    """.encode())
-                    return
-                
-                # Store callback data for the main app to process
-                callback_url = f"http://localhost{self.path}"
-                app_instance.handle_oauth_callback_async(callback_url)
-                
-                # Send success response with instructions
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html')
-                self.end_headers()
-                self.wfile.write("""
-                <html><body>
-                <h2>Authentication Successful!</h2>
-                <p>You have been signed in successfully. You can now close this tab and return to the application.</p>
-                <script>
-                    // Try to close the tab automatically
-                    setTimeout(function() {
-                        window.close();
-                    }, 2000);
-                </script>
-                <p><a href="/">Return to application</a></p>
-                </body></html>
-                """.encode())
-                
-            else:
-                # Handle other requests
-                self.send_response(404)
-                self.send_header('Content-Type', 'text/html')
-                self.end_headers()
-                self.wfile.write("""
-                <html><body>
-                <h2>Not Found</h2>
-                <p><a href="/">Return to application</a></p>
-                </body></html>
-                """.encode())
-                
-        except Exception as e:
-            logger.error(f"Error handling OAuth callback: {e}")
-            self.send_response(500)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            self.wfile.write(f"""
-            <html><body>
-            <h2>Server Error</h2>
-            <p>Error processing request: {str(e)}</p>
-            <p><a href="/">Return to application</a></p>
-            </body></html>
-            """.encode())
-    
-    def log_message(self, format, *args):
-        """Suppress default HTTP server logging"""
-        pass
-
 class ComfyUIClientApp:
     def __init__(self):
         self.current_user = None
         self.current_session_id = None
         self.pending_oauth_states = {}  # Store OAuth state tokens
         self.oauth_callback_data = {}  # Store callback data
-        self.callback_server = None
-        self.callback_server_thread = None
-        
-    def start_callback_server(self):
-        """Start the OAuth callback server"""
-        try:
-            self.callback_server = HTTPServer(('localhost', 8080), OAuthCallbackHandler)
-            self.callback_server_thread = threading.Thread(
-                target=self.callback_server.serve_forever,
-                daemon=True
-            )
-            self.callback_server_thread.start()
-            logger.info("OAuth callback server started on http://localhost:8080")
-        except Exception as e:
-            logger.error(f"Failed to start callback server: {e}")
-    
-    def stop_callback_server(self):
-        """Stop the OAuth callback server"""
-        if self.callback_server:
-            self.callback_server.shutdown()
-            self.callback_server = None
-            logger.info("OAuth callback server stopped")
         
     def start_oauth_login(self) -> Tuple[str, str]:
         """Start Google OAuth login process."""
         if not auth_manager.client_id:
             return "Google OAuth not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your environment.", ""
-        
-        # Start callback server if not already running
-        if not self.callback_server:
-            self.start_callback_server()
         
         # Generate state token for security
         state = secrets.token_urlsafe(32)
@@ -161,7 +44,7 @@ class ComfyUIClientApp:
         return f"Click the link below to sign in with Google:\n\n[Sign in with Google]({auth_url})\n\nAfter signing in, you'll be redirected back automatically.", auth_url
     
     def handle_oauth_callback_async(self, callback_url: str):
-        """Handle OAuth callback asynchronously (called from callback server)"""
+        """Handle OAuth callback asynchronously (called from FastAPI route)"""
         try:
             message, is_logged_in, user_info = self.handle_oauth_callback(callback_url)
             # Store the result for the main app to pick up
@@ -181,7 +64,7 @@ class ComfyUIClientApp:
                 'timestamp': time.time()
             }
     
-    def check_oauth_status(self) -> Tuple[str, bool, Dict[str, Any], bool]:
+    def check_oauth_status(self) -> Tuple[str, bool, Dict[str, Any], bool, List[str], str]:
         """Check if OAuth callback has been processed"""
         if self.oauth_callback_data:
             data = self.oauth_callback_data
@@ -413,6 +296,78 @@ class ComfyUIClientApp:
 
 # Create app instance
 app_instance = ComfyUIClientApp()
+
+# Create FastAPI app for OAuth callback handling
+app = FastAPI()
+
+@app.get("/auth/callback")
+async def oauth_callback(request: Request):
+    """Handle OAuth callback from Google"""
+    try:
+        # Get the full URL with query parameters
+        callback_url = str(request.url)
+        
+        # Process the callback
+        app_instance.handle_oauth_callback_async(callback_url)
+        
+        # Return success page
+        return HTMLResponse("""
+        <html>
+        <head>
+            <title>Sign-In Successful</title>
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
+                .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                .success { color: #4CAF50; font-size: 24px; margin-bottom: 20px; }
+                .instructions { color: #666; margin-bottom: 30px; line-height: 1.6; }
+                .button { display: inline-block; padding: 12px 24px; background: #4CAF50; color: white; text-decoration: none; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="success">✅ Authentication Successful!</div>
+                <div class="instructions">
+                    You have been signed in successfully.<br>
+                    Please return to the main application and click "Check Sign-In Status" to complete the login process.
+                </div>
+                <a href="/" class="button">Return to Application</a>
+            </div>
+            <script>
+                // Auto-refresh parent window if this is opened in a popup
+                if (window.opener && !window.opener.closed) {
+                    window.opener.focus();
+                    setTimeout(() => window.close(), 3000);
+                } else {
+                    // Try to redirect back to main app after 5 seconds
+                    setTimeout(() => window.location.href = '/', 5000);
+                }
+            </script>
+        </body>
+        </html>
+        """)
+        
+    except Exception as e:
+        logger.error(f"Error in OAuth callback: {e}")
+        return HTMLResponse(f"""
+        <html>
+        <head>
+            <title>Authentication Error</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }}
+                .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                .error {{ color: #f44336; font-size: 24px; margin-bottom: 20px; }}
+                .button {{ display: inline-block; padding: 12px 24px; background: #2196F3; color: white; text-decoration: none; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="error">❌ Authentication Error</div>
+                <p>Error: {str(e)}</p>
+                <a href="/" class="button">Return to Application</a>
+            </div>
+        </body>
+        </html>
+        """)
 
 def create_interface():
     """Create the Gradio interface with Google OAuth."""
@@ -676,13 +631,15 @@ def main():
     
     demo = create_interface()
     
-    # Launch the application
-    demo.launch(
-        server_name=Config.GRADIO_HOST,
-        server_port=Config.GRADIO_PORT,
-        share=False,
-        debug=True,
-        auth=None  # We handle auth ourselves
+    # Mount Gradio app to FastAPI
+    app.mount("/", gr.mount_gradio_app(app, demo, path="/"))
+    
+    # Launch the application with FastAPI
+    uvicorn.run(
+        app,
+        host=Config.GRADIO_HOST,
+        port=Config.GRADIO_PORT,
+        log_level="info"
     )
 
 if __name__ == "__main__":
